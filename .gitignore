@@ -1,0 +1,66 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Virtual Environments ---
+venv/
+env/
+ENV/
+.venv/
+python/Scripts/
+python/Lib/
+python/Include/
+python/library/
+python/share/
+python/pyvenv.cfg
+
+# --- Database (SQLite) ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Sensitive Credentials & Environment ---
+.env
+.env.*
+houseparty-*-firebase-adminsdk-*.json
+secrets.json
+*.p12
+*.pem
+
+# --- Firebase & Tooling Artifacts ---
+.firebase/
+firebase-debug.log*
+.runtimeconfig.json
+token.json
+body.json
+response.json
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+logs/
