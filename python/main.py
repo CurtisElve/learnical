@@ -3,16 +3,22 @@
 import io
 import warnings
 from contextlib import asynccontextmanager
+
 import torch
-from fastapi import Depends, File, FastAPI, UploadFile
+from fastapi import Depends, File, FastAPI, HTTPException, UploadFile
 from PIL import Image
 from sqlmodel import Session, select
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
 from qwen_vl_utils import process_vision_info
 
 warnings.filterwarnings("ignore", message=".*clean_up_tokenization_spaces.*")
 
 import pytesseract
+import json
+import anthropic
+import base64
+_anthropic = anthropic.Anthropic()
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # --- device ---
@@ -21,8 +27,8 @@ device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 # --- load model once at module level ---
 _processor = AutoProcessor.from_pretrained(
     "prithivMLmods/Callisto-OCR3-2B-Instruct",
-    min_pixels=256 * 28 * 28,   # floor: don't over-shrink small images
-    max_pixels=512 * 28 * 28,   # cap: biggest win for CPU speed
+    min_pixels=256 * 28 * 28,  # floor: don't over-shrink small images
+    max_pixels=512 * 28 * 28,  # cap: biggest win for CPU speed
 )
 _model = Qwen2VLForConditionalGeneration.from_pretrained(
     "prithivMLmods/Callisto-OCR3-2B-Instruct",
@@ -33,17 +39,20 @@ _model.eval()  # disable dropout etc, slight speedup on inference
 
 
 def run_ocr(image: Image.Image) -> str:
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": "Transcribe every word you see in this image. Output only the transcribed text, nothing else."},
-        ],
-    }]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {
+                    "type": "text",
+                    "text": "Transcribe every word you see in this image. Output only the transcribed text, nothing else.",
+                },
+            ],
+        }
+    ]
 
-    text = _processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    text = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     inputs = _processor(
         text=[text],
@@ -56,22 +65,19 @@ def run_ocr(image: Image.Image) -> str:
     with torch.no_grad():  # don't track gradients, saves memory + speed
         generated_ids = _model.generate(**inputs, max_new_tokens=64)
 
-    generated_ids_trimmed = [
-        out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)
-    ]
+    generated_ids_trimmed = [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated_ids)]
     return _processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )[0].strip()
 
 
 from database import engine, get_session
-from models import Example, OCRResult, SQLModel
+from models import Example, OCRResult, SQLModel, Student, StudentWorksheet, Worksheet
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Create all tables on startup, using the shared engine from database.py
     SQLModel.metadata.create_all(engine)
     yield
 
@@ -97,6 +103,32 @@ def create_example(example: Example, session: Session = Depends(get_session)):
     return example
 
 
+@app.post("/students", response_model=Student)
+def create_student(student: Student, session: Session = Depends(get_session)) -> Student:
+    """Create a new student profile."""
+    session.add(student)
+    session.commit()
+    session.refresh(student)
+    return student
+
+
+@app.get("/students/{student_id}", response_model=Student)
+def get_student(student_id: int, session: Session = Depends(get_session)) -> Student:
+    student = session.get(Student, student_id)
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return student
+
+
+@app.post("/worksheets", response_model=Worksheet)
+def create_worksheet(worksheet: Worksheet, session: Session = Depends(get_session)) -> Worksheet:
+    """Create a worksheet definition, including questions JSON."""
+    session.add(worksheet)
+    session.commit()
+    session.refresh(worksheet)
+    return worksheet
+
+
 @app.post("/ocr", response_model=OCRResult)
 async def ocr(file: UploadFile = File(..., description="Image or PDF file")):
     content = await file.read()
@@ -104,6 +136,7 @@ async def ocr(file: UploadFile = File(..., description="Image or PDF file")):
 
     if content_type == "application/pdf":
         from pdf2image import convert_from_bytes
+
         pages = convert_from_bytes(content)
         parts = [pytesseract.image_to_string(page) for page in pages]
         text = "\n\n".join(parts).strip()
@@ -112,3 +145,107 @@ async def ocr(file: UploadFile = File(..., description="Image or PDF file")):
         text = run_ocr(image)
 
     return OCRResult(text=text)
+
+
+def build_grading_payload(worksheet: Worksheet, ocr_text: str) -> dict:
+    """Shape sent to the local grading AI."""
+    return {
+        "worksheet_id": worksheet.id,
+        "worksheet_identifier": worksheet.identifier,
+        "subject": worksheet.subject,
+        "questions": worksheet.questions,
+        "ocr_text": ocr_text,
+    }
+
+
+def call_grader(payload: dict) -> dict:  # no image param anymore
+    questions_str = json.dumps(payload["questions"], indent=2)
+
+    prompt = f"""You are grading a student worksheet for subject: {payload["subject"]}.
+
+    Here are the questions and correct answers:
+    {questions_str}
+
+    Here is the OCR transcription of the student's handwritten answers:
+    {payload["ocr_text"]}
+
+    Return ONLY a JSON object in exactly this format, no other text:
+    {{
+    "questions": [
+        {{
+        "question_id": 1,
+        "student_answer": "what the student wrote",
+        "score": 0.8,
+        "max_score": 1.0,
+        "feedback": "short feedback string"
+        }}
+    ],
+    "total_score": 0.75,
+    "max_score": 5.0
+    }}"""
+
+    response = _anthropic.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+
+    return json.loads(raw.strip())
+
+
+@app.post("/grade", response_model=StudentWorksheet)
+async def grade_worksheet(
+    worksheet_id: int,
+    student_id: int,
+    file: UploadFile = File(..., description="Worksheet image to grade"),
+    session: Session = Depends(get_session),
+) -> StudentWorksheet:
+    """
+    Grade a worksheet image for a given student.
+
+    This endpoint:
+    - Fetches the Worksheet + Student from the DB
+    - Runs OCR on the uploaded image
+    - Sends a structured payload to the grader
+    - Persists a StudentWorksheet row with per-question marks
+    """
+    worksheet = session.get(Worksheet, worksheet_id)
+    if not worksheet:
+        raise HTTPException(status_code=404, detail="Worksheet not found")
+
+    student = session.get(Student, student_id)
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    # OCR the uploaded image
+    content = await file.read()
+    image = Image.open(io.BytesIO(content)).convert("RGB")
+    ocr_text = run_ocr(image)
+
+    # Prepare payload and delegate grading to AI
+    payload = build_grading_payload(worksheet, ocr_text)
+    grading_result = call_grader(payload)
+
+    marks = grading_result.get("questions", {})
+    total_score = grading_result.get("total_score")
+    max_score = grading_result.get("max_score")
+
+    # Persist graded attempt to the database
+    student_worksheet = StudentWorksheet(
+        student_id=student.id,
+        worksheet_id=worksheet.id,
+        marks=marks,
+        total_score=total_score,
+        max_score=max_score,
+    )
+    session.add(student_worksheet)
+    session.commit()
+    session.refresh(student_worksheet)
+
+    return student_worksheet
