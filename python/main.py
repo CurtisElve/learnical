@@ -38,7 +38,8 @@ _model = Qwen2VLForConditionalGeneration.from_pretrained(
 _model.eval()  # disable dropout etc, slight speedup on inference
 
 
-def run_ocr(image: Image.Image, subject: str, questions: str) -> str:
+def run_ocr(image: Image.Image) -> str:
+    """Generic OCR helper using the local Qwen model."""
     messages = [
         {
             "role": "user",
@@ -46,21 +47,15 @@ def run_ocr(image: Image.Image, subject: str, questions: str) -> str:
                 {"type": "image", "image": image},
                 {
                     "type": "text",
-                    "text": f"""Look at this image. There is handwriting in it. Write down exactly what the handwriting says. 
-
-The handwriting is a student answering these math questions about {subject}:
-{questions}
-
-Copy the handwritten text exactly. Do not write [student work] or any placeholder. Do not skip anything. Just write what you see written in pencil or pen on the page.
-
-use LaTeX for mathematical notation.""",
+                    "text": "Transcribe every word and symbol you see in this image. "
+                    "Output only the transcribed text, nothing else.",
                 },
             ],
         }
     ]
 
     text = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
+    image_inputs, _ = process_vision_info(messages)
     inputs = _processor(
         text=[text],
         images=image_inputs,
@@ -154,47 +149,74 @@ async def ocr(file: UploadFile = File(..., description="Image or PDF file")):
     return OCRResult(text=text)
 
 
-def build_grading_payload(worksheet: Worksheet, ocr_text: str) -> dict:
-    """Shape sent to the local grading AI."""
+def build_grading_payload(worksheet: Worksheet, image_b64: str) -> dict:
+    """Shape sent to the grading AI."""
     return {
         "worksheet_id": worksheet.id,
         "worksheet_identifier": worksheet.identifier,
         "subject": worksheet.subject,
         "questions": worksheet.questions,
-        "ocr_text": ocr_text,
+        "image_b64": image_b64,
     }
 
 
-def call_grader(payload: dict) -> dict:  # no image param anymore
+def call_grader(payload: dict) -> dict:
     questions_str = json.dumps(payload["questions"], indent=2)
+    image_b64 = payload["image_b64"]
 
-    prompt = f"""You are grading a student worksheet for subject: {payload["subject"]}.
+    system_prompt = (
+        "You are a strict but fair teacher grading a handwritten worksheet. "
+        "You can see the original printed worksheet image and know the canonical questions and correct answers. "
+        "Grade the student's handwritten work directly from the image — do not rely solely on any OCR or assumptions. "
+        "Be concise with feedback and focus on mathematical correctness and the specific learning skills."
+    )
 
-    Here are the questions and correct answers:
-    {questions_str}
+    user_text = f"""
+Subject: {payload["subject"]}
 
-    Here is the OCR transcription of the student's handwritten answers:
-    {payload["ocr_text"]}
+Here are the questions and correct answers as structured JSON:
+{questions_str}
 
-    Return ONLY a JSON object in exactly this format, no other text:
+Using ONLY the student's handwritten work visible in the attached image, detect what the student wrote for each question,
+grade it, and return ONLY a JSON object in exactly this format, with no extra text or markdown:
+{{
+  "questions": [
     {{
-    "questions": [
-        {{
-        "question_id": 1,
-        "student_answer": "what the student wrote",
-        "score": 0.8,
-        "max_score": 1.0,
-        "feedback": "short feedback string"
-        }}
-    ],
-    "total_score": 0.75,
-    "max_score": 5.0
-    }}"""
+      "question_id": 1,
+      "student_answer": "what the student actually wrote",
+      "score": 0.8,
+      "max_score": 1.0,
+      "feedback": "short feedback string about this one question"
+    }}
+  ],
+  "total_score": 0.75,
+  "max_score": 5.0
+}}
+"""
 
     response = _anthropic.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}]
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": user_text,
+                    },
+                ],
+            }
+        ],
     )
 
     raw = response.content[0].text.strip()
@@ -230,17 +252,19 @@ async def grade_worksheet(
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    # OCR the uploaded image
+    # Read the uploaded image and send it directly to the grader (no local OCR in this flow)
     content = await file.read()
-    image = Image.open(io.BytesIO(content)).convert("RGB")
-    questions = [x["prompt"] for x in worksheet.questions]
-    ocr_text = run_ocr(image, worksheet.subject, json.dumps(questions))
-    print(ocr_text)
+    image_b64 = base64.b64encode(content).decode("utf-8")
+
     # Prepare payload and delegate grading to AI
-    payload = build_grading_payload(worksheet, ocr_text)
+    payload = build_grading_payload(worksheet, image_b64)
     grading_result = call_grader(payload)
-    print(grading_result)
-    marks = grading_result.get("questions", {})
+    # Grader returns questions as a list; StudentWorksheet.marks expects a dict keyed by question_id
+    questions_list = grading_result.get("questions", [])
+    marks = {
+        str(q.get("question_id", i + 1)): q
+        for i, q in enumerate(questions_list)
+    }
     total_score = grading_result.get("total_score")
     max_score = grading_result.get("max_score")
 
