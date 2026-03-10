@@ -46,17 +46,14 @@ def run_ocr(image: Image.Image, subject: str, questions: str) -> str:
                 {"type": "image", "image": image},
                 {
                     "type": "text",
-                    "text": f"""You are reading a photo of a student's completed worksheet.
-The printed questions on the worksheet are: {questions}
-Your job is to transcribe word for word ONLY the students handwritten work below each question.
-Subject: {subject}
+                    "text": f"""Look at this image. There is handwriting in it. Write down exactly what the handwriting says. 
 
-For each question number, write what the student handwrote as their response exactly as it appears under each question.
-Use LaTeX for any math. If handwriting is unclear make your best guess based on context.
-Format:
-1. [student work]
-2. [student work]
-etc.""",
+The handwriting is a student answering these math questions about {subject}:
+{questions}
+
+Copy the handwritten text exactly. Do not write [student work] or any placeholder. Do not skip anything. Just write what you see written in pencil or pen on the page.
+
+use LaTeX for mathematical notation.""",
                 },
             ],
         }
