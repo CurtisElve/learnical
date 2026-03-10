@@ -1,5 +1,5 @@
 """FastAPI app entrypoint with SQLModel."""
-
+import os
 import io
 import warnings
 from contextlib import asynccontextmanager
@@ -18,7 +18,7 @@ import pytesseract
 import json
 import anthropic
 import base64
-_anthropic = anthropic.Anthropic()
+_anthropic = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # --- device ---
@@ -28,7 +28,7 @@ device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 _processor = AutoProcessor.from_pretrained(
     "prithivMLmods/Callisto-OCR3-2B-Instruct",
     min_pixels=256 * 28 * 28,  # floor: don't over-shrink small images
-    max_pixels=512 * 28 * 28,  # cap: biggest win for CPU speed
+    max_pixels=1280 * 28 * 28,  # cap: biggest win for CPU speed
 )
 _model = Qwen2VLForConditionalGeneration.from_pretrained(
     "prithivMLmods/Callisto-OCR3-2B-Instruct",
@@ -38,7 +38,7 @@ _model = Qwen2VLForConditionalGeneration.from_pretrained(
 _model.eval()  # disable dropout etc, slight speedup on inference
 
 
-def run_ocr(image: Image.Image) -> str:
+def run_ocr(image: Image.Image, subject: str, questions: str) -> str:
     messages = [
         {
             "role": "user",
@@ -46,7 +46,17 @@ def run_ocr(image: Image.Image) -> str:
                 {"type": "image", "image": image},
                 {
                     "type": "text",
-                    "text": "Transcribe every word you see in this image. Output only the transcribed text, nothing else.",
+                    "text": f"""You are reading a photo of a student's completed worksheet.
+The printed questions on the worksheet are: {questions}
+Your job is to transcribe word for word ONLY the students handwritten work below each question.
+Subject: {subject}
+
+For each question number, write what the student handwrote as their response exactly as it appears under each question.
+Use LaTeX for any math. If handwriting is unclear make your best guess based on context.
+Format:
+1. [student work]
+2. [student work]
+etc.""",
                 },
             ],
         }
@@ -57,13 +67,13 @@ def run_ocr(image: Image.Image) -> str:
     inputs = _processor(
         text=[text],
         images=image_inputs,
-        videos=video_inputs,
+        videos=None,
         padding=True,
         return_tensors="pt",
     ).to(device)
 
     with torch.no_grad():  # don't track gradients, saves memory + speed
-        generated_ids = _model.generate(**inputs, max_new_tokens=64)
+        generated_ids = _model.generate(**inputs, max_new_tokens=512)
 
     generated_ids_trimmed = [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated_ids)]
     return _processor.batch_decode(
@@ -226,12 +236,13 @@ async def grade_worksheet(
     # OCR the uploaded image
     content = await file.read()
     image = Image.open(io.BytesIO(content)).convert("RGB")
-    ocr_text = run_ocr(image)
-
+    questions = [x["prompt"] for x in worksheet.questions]
+    ocr_text = run_ocr(image, worksheet.subject, json.dumps(questions))
+    print(ocr_text)
     # Prepare payload and delegate grading to AI
     payload = build_grading_payload(worksheet, ocr_text)
     grading_result = call_grader(payload)
-
+    print(grading_result)
     marks = grading_result.get("questions", {})
     total_score = grading_result.get("total_score")
     max_score = grading_result.get("max_score")

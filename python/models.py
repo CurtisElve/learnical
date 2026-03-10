@@ -1,8 +1,9 @@
 """SQLModel table and API models."""
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from sqlalchemy import JSON, Column
 from sqlmodel import Field, SQLModel
 
 
@@ -33,16 +34,12 @@ class Worksheet(SQLModel, table=True):
     subject: str
     image_url: Optional[str] = None
 
-    # Arbitrary JSON structure:
-    # {
-    #   "q1": {
-    #       "prompt": "...",
-    #       "correct_answer": "...",
-    #       "learning_skills": ["fractions", "algebra_basics"]
-    #   },
-    #   ...
-    # }
-    questions: Dict[str, Any] = Field(default_factory=dict, sa_column_kwargs={"nullable": False})
+    # List of question objects, e.g.:
+    # [{"prompt": "...", "correct_answer": "...", "learning_skills": ["fractions", ...]}, ...]
+    questions: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -59,11 +56,17 @@ class Student(SQLModel, table=True):
 
     # Example:
     # {"fractions": 72, "reading_comprehension": 88}
-    learning_skills: Dict[str, Any] = Field(default_factory=dict, sa_column_kwargs={"nullable": False})
+    learning_skills: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+    )
 
     # Example:
     # {"math": 0.83, "reading": 0.65}  # 0-1 percentiles, or 0-100 depending on your UI
-    subject_percentiles: Dict[str, Any] = Field(default_factory=dict, sa_column_kwargs={"nullable": False})
+    subject_percentiles: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+    )
 
     # Streak of active learning days
     streak_days: int = Field(default=0)
@@ -98,7 +101,10 @@ class StudentWorksheet(SQLModel, table=True):
     #   },
     #   ...
     # }
-    marks: Dict[str, Any] = Field(default_factory=dict, sa_column_kwargs={"nullable": False})
+    marks: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+    )
 
     # Optional rollup stats
     total_score: Optional[float] = None
