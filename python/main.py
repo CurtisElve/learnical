@@ -149,7 +149,7 @@ async def ocr(file: UploadFile = File(..., description="Image or PDF file")):
     return OCRResult(text=text)
 
 
-def build_grading_payload(worksheet: Worksheet, image_b64: str) -> dict:
+def build_grading_payload(worksheet: Worksheet, image_b64: str, media_type: str) -> dict:
     """Shape sent to the grading AI."""
     return {
         "worksheet_id": worksheet.id,
@@ -157,12 +157,14 @@ def build_grading_payload(worksheet: Worksheet, image_b64: str) -> dict:
         "subject": worksheet.subject,
         "questions": worksheet.questions,
         "image_b64": image_b64,
+        "image_media_type": media_type,
     }
 
 
 def call_grader(payload: dict) -> dict:
     questions_str = json.dumps(payload["questions"], indent=2)
     image_b64 = payload["image_b64"]
+    media_type = payload.get("image_media_type") or "image/jpeg"
 
     system_prompt = (
         "You are a strict but fair teacher grading a handwritten worksheet. "
@@ -206,7 +208,7 @@ grade it, and return ONLY a JSON object in exactly this format, with no extra te
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": "image/png",
+                            "media_type": media_type,
                             "data": image_b64,
                         },
                     },
@@ -255,9 +257,10 @@ async def grade_worksheet(
     # Read the uploaded image and send it directly to the grader (no local OCR in this flow)
     content = await file.read()
     image_b64 = base64.b64encode(content).decode("utf-8")
+    media_type = file.content_type or "image/jpeg"
 
     # Prepare payload and delegate grading to AI
-    payload = build_grading_payload(worksheet, image_b64)
+    payload = build_grading_payload(worksheet, image_b64, media_type)
     grading_result = call_grader(payload)
     # Grader returns questions as a list; StudentWorksheet.marks expects a dict keyed by question_id
     questions_list = grading_result.get("questions", [])
