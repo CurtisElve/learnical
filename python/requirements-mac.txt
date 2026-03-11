@@ -1,0 +1,29 @@
+# macOS pip requirements for Learnical app
+# Note: You plan to install `torch` separately — it is intentionally omitted here.
+
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+sqlmodel>=0.0.8
+sqlalchemy>=1.4
+
+transformers>=4.35.0
+huggingface-hub>=0.16.4
+accelerate>=0.22.0
+tokenizers>=0.13.3
+
+Pillow>=9.0.0
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+
+anthropic>=0.6.0
+python-multipart>=0.0.6
+aiofiles>=23.1.0
+requests>=2.31.0
+typing-extensions>=4.5.0
+
+# Optional: if you use local/utils packages not on PyPI, install them separately.
+
+# macOS system dependencies (install with Homebrew):
+#   brew install tesseract poppler
+# If using PDFs, `pdf2image` requires `poppler` (for `pdftoppm`).
+# `pytesseract` requires the Tesseract binary.
