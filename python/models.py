@@ -1,7 +1,7 @@
 """SQLModel table and API models."""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from sqlalchemy import JSON, Column
 from sqlmodel import Field, SQLModel
@@ -34,9 +34,16 @@ class Worksheet(SQLModel, table=True):
     subject: str
     image_url: Optional[str] = None
 
-    # List of question objects, e.g.:
-    # [{"prompt": "...", "correct_answer": "...", "learning_skills": ["fractions", ...]}, ...]
-    questions: List[Dict[str, Any]] = Field(
+    # List of question objects, or dict keyed by q1, q2, ... (JSON stores either)
+    # [{"prompt": "...", "correct_answer": "...", "learning_skills": [...]}, ...]
+    questions: Union[List[Dict[str, Any]], Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
+
+    # Vertical answer regions: list of [start_pct, end_pct] (JSON arrays, not tuples)
+    # Example: [[20, 30], [40, 45]] = 20–30% and 40–45% of page height
+    answer_regions: List[List[int]] = Field(
         default_factory=list,
         sa_column=Column(JSON, nullable=False),
     )
