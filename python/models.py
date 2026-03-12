@@ -21,6 +21,32 @@ class Example(SQLModel, table=True):
 # --- Core Learnical domain tables ---
 
 
+class Question(SQLModel, table=True):
+    """Individual question definition."""
+
+    __tablename__ = "questions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    prompt: str
+    answer: str
+
+    # Skills this question exercises (tags like "fractions", "reading_comprehension", ...)
+    skills: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
+
+    # Vertical height band this question nominally occupies (percentage of page height)
+    height: int
+
+    # Difficulty from 1–10
+    difficulty: int
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Worksheet(SQLModel, table=True):
     """Worksheet definition and metadata."""
 
@@ -34,9 +60,9 @@ class Worksheet(SQLModel, table=True):
     subject: str
     image_url: Optional[str] = None
 
-    # List of question objects, or dict keyed by q1, q2, ... (JSON stores either)
-    # [{"prompt": "...", "correct_answer": "...", "learning_skills": [...]}, ...]
-    questions: Union[List[Dict[str, Any]], Dict[str, Any]] = Field(
+    # Ordered list of question IDs that make up this worksheet.
+    # Stored as JSON array of ints in the database.
+    questions: List[int] = Field(
         default_factory=list,
         sa_column=Column(JSON, nullable=False),
     )
@@ -72,6 +98,12 @@ class Student(SQLModel, table=True):
     # {"math": 0.83, "reading": 0.65}  # 0-1 percentiles, or 0-100 depending on your UI
     subject_percentiles: Dict[str, Any] = Field(
         default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+    )
+
+    # Skills the student has fully mastered (tag names)
+    mastered: List[str] = Field(
+        default_factory=list,
         sa_column=Column(JSON, nullable=False),
     )
 
