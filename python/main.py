@@ -1,13 +1,13 @@
 """FastAPI app entrypoint with SQLModel."""
 import os
 import io
+import time
 import warnings
 from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
 import torch
-import torch_directml
 from fastapi import Depends, File, FastAPI, HTTPException, UploadFile
 from PIL import Image
 from sqlmodel import Session, select
@@ -50,6 +50,17 @@ def _cv_to_pil(image: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
 
 
+def _save_debug_cv(image: np.ndarray, label: str) -> None:
+    """Best-effort debug image writer; failures are ignored."""
+    try:
+        ts = int(time.time() * 1000)
+        filename = f"debug_{label}_{ts}.png"
+        # Handle grayscale vs color automatically
+        cv2.imwrite(filename, image)
+    except Exception:
+        pass
+
+
 # Minimum size for Callisto/Qwen2-VL so the vision encoder's patch grid is valid (avoids "input must be 4-dimensional").
 _MIN_OCR_HEIGHT = 224
 _MIN_OCR_WIDTH = 224
@@ -68,45 +79,101 @@ def _ensure_min_size(image: Image.Image, min_w: int = _MIN_OCR_WIDTH, min_h: int
 
 
 def deskew_and_enhance(image: Image.Image) -> Image.Image:
-    """
-    No-op for now: skew/enhance commented out. Only chopping (answer_regions) is used.
-    Ensures RGB for downstream.
-    """
-    # --- skew + CLAHE commented out to avoid confusing errors; re-enable when needed ---
     cv_img = _pil_to_cv(image)
+    _save_debug_cv(cv_img, "deskew_orig")
+
+    h, w = cv_img.shape[:2]
+    img_area = float(h * w)
+
+    # 1) grayscale + blur
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 50, 150)
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            pts = approx.reshape(4, 2).astype("float32")
-            s = pts.sum(axis=1)
-            diff = np.diff(pts, axis=1)
-            rect = np.zeros((4, 2), dtype="float32")
-            rect[0] = pts[np.argmin(s)]
-            rect[2] = pts[np.argmax(s)]
-            rect[1] = pts[np.argmin(diff)]
-            rect[3] = pts[np.argmax(diff)]
-            (tl, tr, br, bl) = rect
-            maxWidth = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-            maxHeight = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-            dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
-            M = cv2.getPerspectiveTransform(rect, dst)
-            warped = cv2.warpPerspective(cv_img, M, (maxWidth, maxHeight))
-        else:
-            warped = cv_img
-    else:
-        warped = cv_img
+    _save_debug_cv(gray, "deskew_gray")
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _save_debug_cv(blur, "deskew_blur")
+
+    # 2) threshold for bright paper
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _save_debug_cv(thresh, "deskew_thresh")
+
+    # 3) find contours
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    debug_contours = cv_img.copy()
+    cv2.drawContours(debug_contours, contours, -1, (0, 0, 255), 2)
+    _save_debug_cv(debug_contours, "deskew_all_contours")
+
+    # 4) find best contour — now using approxPolyDP to get real corners
+    best_box = None
+    best_score = 0.0
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 0.1 * img_area or area > 0.95 * img_area:
+            continue
+
+        # Try to get 4 real corners from the contour shape
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        if len(approx) != 4:
+            # Try convex hull if direct approx didn't give 4 corners
+            hull = cv2.convexHull(cnt)
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+
+        if len(approx) != 4:
+            continue
+
+        box = approx.reshape(4, 2).astype("float32")
+
+        # Sanity check aspect ratio
+        box_sorted = box[np.argsort(box[:, 1])]
+        top_two = box_sorted[:2][np.argsort(box_sorted[:2, 0])]
+        bot_two = box_sorted[2:][np.argsort(box_sorted[2:, 0])]
+        tl, tr = top_two
+        bl, br = bot_two
+        pw = max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))
+        ph = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
+        if pw <= 0 or ph <= 0:
+            continue
+        ar = max(pw, ph) / min(pw, ph)
+        if not (1.0 <= ar <= 2.5):
+            continue
+
+        score = area
+        if score > best_score:
+            best_score = score
+            best_box = (box, tl, tr, br, bl, int(pw), int(ph))
+
+    if best_box is None:
+        return image.convert("RGB")
+
+    box, tl, tr, br, bl, page_w, page_h = best_box
+    src = np.array([tl, tr, br, bl], dtype="float32")
+
+    debug_box = cv_img.copy()
+    cv2.drawContours(debug_box, [src.astype(int)], -1, (0, 255, 0), 3)
+    _save_debug_cv(debug_box, "deskew_selected_rect")
+
+    # 5) perspective warp using actual corner points
+    dst = np.array([
+        [0, 0],
+        [page_w - 1, 0],
+        [page_w - 1, page_h - 1],
+        [0, page_h - 1],
+    ], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(cv_img, M, (page_w, page_h))
+    _save_debug_cv(warped, "deskew_warped")
+
+    # 6) CLAHE contrast enhancement
     lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+    L, A, B = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    L2 = clahe.apply(L)
+    enhanced = cv2.cvtColor(cv2.merge((L2, A, B)), cv2.COLOR_LAB2BGR)
+    _save_debug_cv(enhanced, "deskew_enhanced")
+
     return _cv_to_pil(enhanced)
 
 
