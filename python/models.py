@@ -53,9 +53,6 @@ class Worksheet(SQLModel, table=True):
     __tablename__ = "worksheets"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-
-    # External identifier (e.g. slug or code)
-    identifier: str = Field(index=True, unique=True)
     title: str
     subject: str
     image_url: Optional[str] = None

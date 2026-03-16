@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import torch
 from fastapi import Depends, File, FastAPI, HTTPException, UploadFile
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from sqlmodel import Session, select
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
@@ -19,6 +19,8 @@ import pytesseract
 import json
 import anthropic
 import base64
+import cloudinary
+import cloudinary.uploader
 
 _anthropic = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -34,7 +36,7 @@ _processor = AutoProcessor.from_pretrained(
 )
 _model = Qwen2VLForConditionalGeneration.from_pretrained(
     "prithivMLmods/Callisto-OCR3-2B-Instruct",
-    torch_dtype=torch.float32,  # half precision, cuts memory ~50%
+    dtype=torch.float32,  # half precision, cuts memory ~50%
 )
 _model = _model.to(device)
 _model.eval()  # disable dropout etc, slight speedup on inference
@@ -217,7 +219,7 @@ def run_ocr(image: Image.Image, subject: str, questions: str) -> str:
 
 
 from database import engine, get_session
-from models import Example, OCRResult, SQLModel, Student, StudentWorksheet, Worksheet
+from models import Example, OCRResult, Question, SQLModel, Student, StudentWorksheet, Worksheet
 
 
 @asynccontextmanager
@@ -265,13 +267,145 @@ def get_student(student_id: int, session: Session = Depends(get_session)) -> Stu
     return student
 
 
+def generate_worksheet_image(worksheet: Worksheet, regions: list[list[int]], session: Session) -> str:
+    """
+    Generate a simple worksheet image with questions drawn in the non-answer regions,
+    upload it to Cloudinary, and return the resulting URL.
+
+    This is a first-pass implementation meant to be edited/tuned.
+    """
+    # Basic page setup (percentage-based layout)
+    width_px, height_px = 1200, 1800
+    bg_color = (255, 255, 255)
+    text_color = (0, 0, 0)
+
+    # Create blank page
+    image = Image.new("RGB", (width_px, height_px), bg_color)
+    draw = ImageDraw.Draw(image)
+
+    # Try to get a decent default font; fall back to PIL default
+    try:
+        font = ImageFont.truetype("Arial.ttf", 32)
+    except Exception:
+        font = ImageFont.load_default()
+
+    # For each question, draw the prompt roughly centered in the gap
+    # above its answer region, so we don't write inside the region.
+    prev_end_pct = 0.0
+    for idx, qid in enumerate(worksheet.questions):
+        q = session.get(Question, qid)
+        if not q:
+            continue
+
+        # If we have a matching region, use it; otherwise, just use a default band.
+        if idx < len(regions):
+            start_pct, _ = regions[idx]
+        else:
+            start_pct = prev_end_pct + 10
+
+        # Gap for this question is from prev_end_pct to start_pct
+        top_gap = (prev_end_pct / 100.0) * height_px
+        bottom_gap = (start_pct / 100.0) * height_px
+
+        if bottom_gap - top_gap < 40:
+            # Not much room; just nudge text a bit above the start of the region
+            text_y = max(0, bottom_gap - 40)
+        else:
+            # Place text in the middle of the gap
+            text_y = top_gap + (bottom_gap - top_gap) / 2.0
+
+        text_x = int(0.08 * width_px)  # 8% from left edge
+        prompt_text = f"{idx + 1}. {q.prompt}"
+
+        # Wrap text naively if it's too long (very rough).
+        max_width = int(0.84 * width_px)
+        words = prompt_text.split()
+        line = ""
+        y = text_y
+        for word in words:
+            test_line = f"{line} {word}".strip()
+            # Use textbbox to measure text size (textsize may not exist on newer Pillow)
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            if w > max_width and line:
+                draw.text((text_x, y), line, fill=text_color, font=font)
+                y += h + 4
+                line = word
+            else:
+                line = test_line
+        if line:
+            draw.text((text_x, y), line, fill=text_color, font=font)
+
+        if idx < len(regions):
+            prev_end_pct = regions[idx][1]
+
+    # Encode image to PNG in-memory
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    buf.seek(0)
+
+    # Upload to Cloudinary using the configured environment (cloud name, API key/secret, etc.)
+    upload_result = cloudinary.uploader.upload(
+        buf
+    )
+    return upload_result.get("secure_url") or upload_result.get("url") or "https://placehold.co/800x1200"
+
+
+def _compute_answer_regions(question_ids: list[int], session: Session) -> list[list[int]]:
+    """
+    Compute answer regions from question heights.
+    First region: start=4, end=4 + (height_0 * 16).
+    Then skip 4; next region starts there, spans (height_1 * 16), and so on.
+    """
+    regions: list[list[int]] = []
+    current: float | None = None
+    for qid in question_ids:
+        q = session.get(Question, qid)
+        if not q:
+            continue
+        if current is None:
+            current = 4.0 * float(q.height)
+        start = current
+        end = start + (float(q.height) * 16.0)
+        regions.append([int(start), int(end)])
+        current = end + 4.0 * float(q.height)
+    return regions
+
+
 @app.post("/worksheets", response_model=Worksheet)
 def create_worksheet(worksheet: Worksheet, session: Session = Depends(get_session)) -> Worksheet:
-    """Create a worksheet definition, including questions JSON."""
+    """Create a worksheet. Computes answer_regions from question heights and generates an image."""
+    regions = _compute_answer_regions(worksheet.questions, session)
+    worksheet.answer_regions = regions
+    worksheet.image_url = generate_worksheet_image(worksheet, regions, session)
     session.add(worksheet)
     session.commit()
     session.refresh(worksheet)
     return worksheet
+
+
+@app.post("/questions", response_model=list[Question])
+def create_questions(
+    questions: list[Question],
+    session: Session = Depends(get_session),
+) -> list[Question]:
+    """Create multiple questions. Accepts a list of question objects and inserts all into the database."""
+    created = []
+    for q in questions:
+        row = Question(
+            prompt=q.prompt,
+            answer=q.answer,
+            skills=q.skills,
+            height=q.height,
+            difficulty=q.difficulty,
+        )
+        session.add(row)
+        created.append(row)
+    session.commit()
+    for row in created:
+        session.refresh(row)
+    return created
 
 
 @app.post("/ocr", response_model=OCRResult)
@@ -343,7 +477,6 @@ def build_grading_payload(worksheet: Worksheet, ocr_text: str) -> dict:
     """Shape sent to the local grading AI."""
     return {
         "worksheet_id": worksheet.id,
-        "worksheet_identifier": worksheet.identifier,
         "subject": worksheet.subject,
         "questions": worksheet.questions,
         "ocr_text": ocr_text,
