@@ -29,3 +29,5 @@ Analyze: Learnical identifies the mathematical symbols and the logical structure
 Grade and Guide: The AI flags errors in logic and provides the correct steps.
 
 Interact: Explore the generated visual example to master the underlying concept.
+
+...
