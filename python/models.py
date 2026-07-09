@@ -21,12 +21,41 @@ class Example(SQLModel, table=True):
 # --- Core Learnical domain tables ---
 
 
+class Topic(SQLModel, table=True):
+    """A curriculum topic: subject -> grade -> unit -> topic.
+
+    This is the Khan-Academy-style library node that questions hang off.
+    """
+
+    __tablename__ = "topics"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    subject: str = Field(index=True)  # "math", "science", "english"
+    grade: str = Field(index=True)  # "K", "1" ... "12"
+    unit: str  # e.g. "Fractions"
+    name: str  # e.g. "Adding fractions with unlike denominators"
+    description: Optional[str] = None
+
+    # Skill tags questions under this topic exercise
+    skills: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Question(SQLModel, table=True):
     """Individual question definition."""
 
     __tablename__ = "questions"
 
     id: Optional[int] = Field(default=None, primary_key=True)
+
+    # Curriculum topic this question belongs to (nullable for ad-hoc questions)
+    topic_id: Optional[int] = Field(default=None, foreign_key="topics.id", index=True)
 
     prompt: str
     answer: str
@@ -126,14 +155,17 @@ class StudentWorksheet(SQLModel, table=True):
     student_id: int = Field(foreign_key="students.id", index=True)
     worksheet_id: int = Field(foreign_key="worksheets.id", index=True)
 
-    # Per-question grading payload:
+    # Per-question grading payload, keyed by question id:
     # {
-    #   "q1": {
-    #       "given_answer": "...",
-    #       "is_correct": true,
-    #       "score": 1.0,
-    #       "comment": "Great job with equivalent fractions",
-    #       "focus_skill": "fractions"
+    #   "12": {
+    #       "transcription": "3/4 + 1/8 = 6/8 + 1/8 = 7/8",
+    #       "final_answer": "7/8",
+    #       "final_answer_score": 1.0,   # correctness of the final answer
+    #       "method_score": 1.0,         # validity of the steps taken
+    #       "work_shown_score": 0.8,     # how completely work was shown
+    #       "score": 0.96,               # weighted combination
+    #       "max_score": 1.0,
+    #       "feedback": "Great use of equivalent fractions."
     #   },
     #   ...
     # }
@@ -157,4 +189,67 @@ class OCRResult(SQLModel):
     """Response model for OCR endpoint. Not a DB table."""
 
     text: str
+
+
+class GenerateQuestionsRequest(SQLModel):
+    """Request body for AI question generation on a topic."""
+
+    count: int = 5
+    difficulty: int = 5  # 1-10 target difficulty
+
+
+class PracticeRequest(SQLModel):
+    """Request body for assembling a practice set / test."""
+
+    topic_ids: List[int]
+    num_questions: int = 5
+    difficulty: int = 5
+    title: Optional[str] = None
+    # When the topic bank doesn't have enough questions, generate the rest
+    generate_missing: bool = True
+    # When set, difficulty adapts to this student's skill levels per topic
+    student_id: Optional[int] = None
+
+
+class PracticeQuestion(SQLModel):
+    """One question in a returned practice set (answer included for review mode)."""
+
+    id: int
+    prompt: str
+    answer: str
+    skills: List[str]
+    difficulty: int
+
+
+class PracticeSet(SQLModel):
+    """A generated practice test."""
+
+    worksheet_id: int
+    title: str
+    subject: str
+    image_url: Optional[str] = None
+    questions: List[PracticeQuestion]
+
+
+class SolveRequest(SQLModel):
+    """Request body for the typed-question tutor endpoint."""
+
+    question: str
+
+
+class SolveStep(SQLModel):
+    """One step of a worked solution."""
+
+    title: str
+    explanation: str
+    work: str
+
+
+class SolveResult(SQLModel):
+    """Step-by-step explanation returned by the tutor endpoints."""
+
+    problem: str
+    steps: List[SolveStep]
+    answer: str
+    concept: str
 
